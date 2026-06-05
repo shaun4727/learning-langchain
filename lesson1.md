@@ -1,3 +1,130 @@
+Excellent. Let us begin laying the groundwork.
+
+### Lesson 1: FastAPI Microservice & Environment Setup
+
+Before introducing AI components, we must establish a robust, containerized foundation.
+
+#### The Architectural "Why"
+
+* **FastAPI:** We are using FastAPI because of its native support for asynchronous programming and Pydantic validation. When we eventually force LLMs to return structured data (like JSON), Pydantic will act as our strict validation layer, ensuring the AI does not hallucinate incorrect data schemas.
+* **Docker:** AI pipelines often require complex system-level dependencies (especially when we integrate `pgvector` later). Containerizing now, especially since running this natively on your Ubuntu 24.04 system makes Docker volume mapping highly performant, guarantees environment parity and prevents dependency conflicts.
+* **Prettier:** Instead of introducing a purely Python-specific linter that fragments your workflow, we will configure Prettier with a Python plugin. This ensures your formatting rules remain consistent across both your Next.js frontend and this FastAPI microservice.
+
+---
+
+### Step 1: Project Structure
+
+Create a new directory for your backend and set up the following file structure:
+
+| File Name | Purpose |
+| --- | --- |
+| `main.py` | The entry point for the FastAPI application. |
+| `requirements.txt` | Python dependency definitions. |
+| `Dockerfile` | Instructions to build the Python environment image. |
+| `docker-compose.yml` | Orchestration for the API (and later, the database). |
+| `package.json` | To manage Prettier and its plugins. |
+| `.prettierrc` | Your unified formatting rules. |
+
+---
+
+### Step 2: The Code Implementation
+
+**1. `requirements.txt**`
+Keep it minimal for now. We will add LangChain and PostgreSQL dependencies in later lessons.
+
+```text
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+
+```
+
+**2. `main.py**`
+We will implement a basic health-check endpoint and configure Cross-Origin Resource Sharing (CORS) immediately so your Next.js frontend can communicate with it locally.
+*Official Documentation Reference:* [FastAPI CORS Middleware](https://fastapi.tiangolo.com/tutorial/cors/)
+
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="Agentic AI Backend", version="1.0.0")
+
+# CORS configuration for the future Next.js frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "agentic-ai-core"}
+
+```
+
+**3. `Dockerfile**`
+We use the slim Python 3.11 image to keep the container lightweight.
+
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# Run uvicorn with live-reload enabled for development
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+```
+
+**4. `docker-compose.yml**`
+This maps your local directory to the container, enabling Uvicorn's live-reload feature.
+
+```yaml
+version: '3.8'
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+
+```
+
+**5. Prettier Configuration**
+To maintain your preferred toolset, initialize a quick Node environment (`npm init -y`) and install the necessary packages: `npm install --save-dev prettier @prettier/plugin-python`.
+
+Then, create your `.prettierrc`:
+
+```json
+{
+  "semi": true,
+  "singleQuote": true,
+  "tabWidth": 2,
+  "plugins": ["@prettier/plugin-python"]
+}
+
+```
+
+---
+
+### Actionable Task
+
+1. Create the files and paste the code provided above.
+2. Open your terminal in the project directory and run: `docker-compose up --build`
+3. Navigate to `http://localhost:8000/docs` in your browser. You should see the automatically generated Swagger UI confirming the `/health` endpoint is active.
+
+Once you have verified the endpoint is running successfully, reply with the word **Finished**, or let me know if you encounter any Docker or system errors.
+
+
+
+
+
 Here is a comprehensive troubleshooting reference table summarizing the environment and Docker configuration hurdles encountered during Lesson 1 on your Ubuntu 24.04 system.
 
 ### Lesson 1: Environment & Docker Troubleshooting Reference
