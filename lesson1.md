@@ -116,7 +116,7 @@ Then, create your `.prettierrc`:
 ### Actionable Task
 
 1. Create the files and paste the code provided above.
-2. Open your terminal in the project directory and run: `docker-compose up --build`
+2. Open your terminal in the project directory and run: `docker compose up --build`
 3. Navigate to `http://localhost:8000/docs` in your browser. You should see the automatically generated Swagger UI confirming the `/health` endpoint is active.
 
 Once you have verified the endpoint is running successfully, reply with the word **Finished**, or let me know if you encounter any Docker or system errors.

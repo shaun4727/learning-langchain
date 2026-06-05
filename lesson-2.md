@@ -143,3 +143,35 @@ docker compose up --build
 5. Run the request and confirm that the response output block cleanly emits structured JSON data conforming perfectly to your Pydantic properties.
 
 Once the payload displays successfully without markdown blocks, reply with the word **Finished**. Let me know if any dependencies trigger compile conflicts along the way!
+
+# # Problem summary
+Here is a comprehensive summary of everything we covered in Lesson 2. Keep this for your technical notes.
+
+### Lesson 2: Troubleshooting & Conceptual Summary
+
+| Problem Encountered | Architectural "Why" (Root Cause) | Solution & Best Practice |
+| --- | --- | --- |
+| **`.env` still tracking in Git after adding to `.gitignore**` | Git was already tracking the `.env` file before the `.gitignore` rule was added. Git ignores rules only apply to untracked files. | Remove the file from Git's cache without deleting it locally using `git rm --cached .env`, commit, and push. **Critical:** Always revoke and rotate any API keys pushed to a remote repository. |
+| **Missing `ChatGoogleGenerativeAI` in main LangChain docs** | LangChain transitioned to a modular architecture to prevent dependency bloat. Vendor-specific code (like Google or OpenAI) was moved into standalone "Partner Packages" (`langchain-google-genai`). | Use the Partner Packages instead of the main `langchain` monolith. Find documentation under the "Integrations" tab rather than core concepts. |
+| **Why not use `create_agent`?** | High-level agent wrappers (`create_react_agent`) inject hidden system prompts that interfere with strict JSON schema compliance. They are also obsolete for our final goal (LangGraph). | Instantiate the raw LLM (`ChatGoogleGenerativeAI`) and bind it directly to Pydantic using `.with_structured_output()` for absolute architectural control. |
+| **Why `ainvoke` instead of `invoke`?** | `invoke` is synchronous and blocks FastAPI's event loop, destroying horizontal scalability. | Use `await ainvoke` to yield the thread during the external network request to Google, allowing FastAPI to process hundreds of other incoming requests concurrently. |
+| **LLM hallucinating on vague input ("what is it?")** | The model is mathematically forced to return the keys in your Pydantic schema. If the input has no technical data, the model must invent data to satisfy the required arrays. | Feed the API actual technical text (logs, bug reports), or modify the Pydantic schema to include a fallback boolean (e.g., `is_valid_technical_text: bool`). |
+| **Classification Drift (e.g., Next.js labeled as a language)** | The schema only provided two buckets (`programming_languages` and `infrastructure_tools`). The model compromised by placing frameworks into the closest logical bucket (languages). | In production, use highly granular Pydantic schemas (e.g., add `software_frameworks: List[str]`) or strict field descriptions to force precise categorization. |
+
+---
+
+### The Core Purpose of the Lesson 2 API
+
+As a full-stack engineer, you know that APIs must be predictable. If a frontend React component expects an array of strings, but the backend sends a markdown block, the UI crashes.
+
+**What this API does:**
+The FastAPI application in Lesson 2 functions as a **Deterministic Extraction Microservice**.
+
+1. **Input:** It takes unpredictable, unstructured human text (like a messy Jira ticket, a bug report, or a sprawling system log).
+2. **Process:** It bypasses standard LLM text generation. Instead, it forces the Gemini engine's internal neural network to compile its output directly into your strictly defined Pydantic schema (`TechnicalFeatureExtractor`).
+3. **Output:** It returns 100% predictable, strongly-typed JSON data.
+
+**Why it matters:**
+This is the foundational building block for Agentic AI. Before an AI Agent can search databases or trigger external APIs, it must be able to securely and predictably extract variables (like tool arguments) from user input without hallucinating bad data structures.
+
+Are you ready to move on to **Lesson 3: PostgreSQL & pgvector Setup**?
