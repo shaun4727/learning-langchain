@@ -1,9 +1,12 @@
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List
 from langchain_google_genai import ChatGoogleGenerativeAI
+from database import engine, Base, get_db
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 app = FastAPI(title="Agentic AI Backend", version="1.0.0")
 
@@ -54,3 +57,18 @@ async def extract_features(text_input: str):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+# Diagnostic endpoint to verify asynchronous database transaction handshakes
+@app.get("/db-test")
+async def test_database_connection(db: AsyncSession = Depends(get_db)):
+    try:
+        # Execute a low-overhead diagnostic query on the async thread pool
+        result = await db.execute(text("SELECT extname FROM pg_extension WHERE extname = 'vector';"))
+        extension_exists = result.scalar()
+        
+        if extension_exists:
+            return {"status": "connected", "database": "postgresql", "pgvector_extension": "active"}
+        raise HTTPException(status_code=500, detail="Database connected but pgvector extension missing.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database handshake failed: {str(e)}")
