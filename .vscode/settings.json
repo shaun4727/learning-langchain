@@ -1,0 +1,48 @@
+{
+	"editor.formatOnSave": true,
+	"editor.linkedEditing": true,
+	"editor.defaultFormatter": "esbenp.prettier-vscode",
+	"workbench.colorTheme": "Andromeda Colorizer",
+	"workbench.iconTheme": "material-icon-theme",
+	"workbench.tree.enableStickyScroll": true,
+	"workbench.colorCustomizations": {
+		"titleBar.activeBackground": "#026CD1",
+		"titleBar.activeForeground": "#FFFFFF"
+	},
+	"editor.fontFamily": "'Fira Code', Consolas",
+	"vue.inlayHints.missingProps": true,
+	"vue.inlayHints.inlineHandlerLeading": true,
+	"vue.inlayHints.optionsWrapper": true,
+	"vue.inlayHints.vBindShorthand": true,
+	"editor.quickSuggestions.comments": true,
+	"javascript.updateImportsOnFileMove.enabled": "never",
+	"javascript.inlayHints.parameterNames.enabled": "all",
+	"javascript.inlayHints.propertyDeclarationTypes.enabled": true,
+	"javascript.inlayHints.parameterTypes.enabled": true,
+	"javascript.inlayHints.enumMemberValues.enabled": true,
+	"javascript.inlayHints.functionLikeReturnTypes.enabled": true,
+	"[javascript]": {
+		"editor.defaultFormatter": "esbenp.prettier-vscode",
+		"editor.formatOnSave": true
+	},
+	"[vue]": {
+		"editor.defaultFormatter": "esbenp.prettier-vscode",
+		"editor.formatOnSave": true
+	},
+	"editor.codeActionsOnSave": {
+		"source.fixAll": "always",
+		"source.fixAll.eslint": "always",
+		"source.organizeImports": "always"
+	},
+	"cSpell.words": [
+		"Challan",
+		"fgproductid",
+		"Jerp",
+		"Linearithmic",
+		"productdtl",
+		"requisitionid",
+		"requisitioninfo",
+		"requisitionno"
+	],
+	"C_Cpp.errorSquiggles": "enabled"
+}

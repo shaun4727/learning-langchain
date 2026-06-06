@@ -13,6 +13,8 @@ from pypdf import PdfReader
 import io
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 import models
+import json
+from fastapi.responses import StreamingResponse
 
 app = FastAPI(title="Agentic AI Backend", version="1.2.0")
 
@@ -214,117 +216,123 @@ class AgentChatRequest(BaseModel):
 
 @app.post("/agent-chat")
 async def agent_reasoning_engine(payload: AgentChatRequest, db: AsyncSession = Depends(get_db)):
-    """Stateful Autonomous Agent: Restores session threads from PostgreSQL, reasons, runs tools, and saves logs."""
-    try:
-        # 1. Hydrate Short-Term Memory: Fetch chronological history for this session thread
-        stmt = (
-            select(models.ChatMessage)
-            .where(models.ChatMessage.session_id == payload.session_id)
-            .order_by(models.ChatMessage.timestamp.asc())
-        )
-        result = await db.execute(stmt)
-        historical_rows = result.scalars().all()
-
-        # 2. Compile Context Message Array for LangChain and Gemini
-        message_list = [
-            SystemMessage(content=(
-                "You are an elite autonomous system agent executing software diagnostic loops.\n"
-                "You have access to historical logs and operational tools to satisfy parameters perfectly.\n"
-                "Review the context of past turns (if any) to address follow-up references cleanly."
-            ))
-        ]
-
-        # Map historical database records directly into structured LangChain message schemas
-        for row in historical_rows:
-            if row.role == "user":
-                message_list.append(HumanMessage(content=row.content))
-            elif row.role == "model":
-                message_list.append(AIMessage(content=row.content))
-
-        # Append the current live user prompt to the very tail of the sequence
-        message_list.append(HumanMessage(content=payload.user_prompt))
-
-        # 3. Initialize reasoning engine and bind existing functional tools
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-        llm_with_tools = llm.bind_tools([SearchKnowledgeBase, GetSystemDiagnostics])
-        
-        # Execute reasoning pass over the entire historical message block
-        ai_msg = await llm_with_tools.ainvoke(message_list)
-        
-        final_answer = ""
-        executed_tools_list = []
-
-        # 4. Handle Operational Tool Execution Logic
-        if not ai_msg.tool_calls:
-            final_answer = ai_msg.content
-            response_source = "direct_llm_with_memory"
-        else:
-            response_source = "agent_tool_execution_with_memory"
-            tool_results = []
+    """Stateful Streaming Agent: Resolves conversational history and streams tool execution logs and response tokens in real-time via SSE."""
+    
+    async def event_generator():
+        try:
+            # 1. Initial Handshake Telemetry
+            yield f"data: {json.dumps({'event': 'status', 'message': 'Hydrating conversation memory...'})}\n\n"
             
-            for tool_call in ai_msg.tool_calls:
-                tool_name = tool_call["name"]
-                tool_args = tool_call["args"]
-                executed_tools_list.append(tool_name)
-                
-                if tool_name == "SearchKnowledgeBase":
-                    embeddings_engine = GoogleGenerativeAIEmbeddings(
-                        model="models/gemini-embedding-001",
-                        output_dimensionality=768
-                    )
-                    query_vector = embeddings_engine.embed_query(tool_args["query"])
-                    
-                    vector_stmt = (
-                        select(models.KnowledgeChunk)
-                        .order_by(models.KnowledgeChunk.embedding.cosine_distance(query_vector))
-                        .limit(3)
-                    )
-                    vector_res = await db.execute(vector_stmt)
-                    matched_chunks = vector_res.scalars().all()
-                    
-                    context_text = "\n---\n".join([c.content for c in matched_chunks]) if matched_chunks else "No content found."
-                    tool_results.append(f"Tool [SearchKnowledgeBase] Output:\n{context_text}")
-                    
-                elif tool_name == "GetSystemDiagnostics":
-                    try:
-                        res = await db.execute(text("SELECT extname FROM pg_extension WHERE extname = 'vector';"))
-                        ext = res.scalar()
-                        status = f"Active connected. pgvector status: {ext}"
-                    except Exception as e:
-                        status = f"Database connectivity error: {str(e)}"
-                    tool_results.append(f"Tool [GetSystemDiagnostics] Output: {status}")
-
-            # Synthesize final answer using the telemetry outputs alongside history
-            combined_tool_context = "\n\n".join(tool_results)
-            synthesis_prompt = (
-                f"Executed Tool Telemetry Output blocks:\n{combined_tool_context}\n\n"
-                "Synthesize your final comprehensive answer now based on this output and the thread context."
+            # Fetch chronological history for this session thread
+            stmt = (
+                select(models.ChatMessage)
+                .where(models.ChatMessage.session_id == payload.session_id)
+                .order_by(models.ChatMessage.timestamp.asc())
             )
+            result = await db.execute(stmt)
+            historical_rows = result.scalars().all()
+
+            # Compile structural LangChain historical sequence matrix
+            message_list = [
+                SystemMessage(content=(
+                    "You are an elite autonomous system agent executing software diagnostic loops.\n"
+                    "Review past conversation history turns to satisfy follow-up instructions smoothly."
+                ))
+            ]
+            for row in historical_rows:
+                if row.role == "user":
+                    message_list.append(HumanMessage(content=row.content))
+                elif row.role == "model":
+                    message_list.append(AIMessage(content=row.content))
+
+            # Append current live prompt execution vector
+            message_list.append(HumanMessage(content=payload.user_prompt))
+
+            # 2. Analyze Intent & Determine Tool Requirements
+            yield f"data: {json.dumps({'event': 'status', 'message': 'Analyzing request intent...'})}\n\n"
             
-            # Temporarily append the telemetry results to guide the final pass
-            message_list.append(AIMessage(content=f"[System Executed Tools: {executed_tools_list}]"))
-            message_list.append(HumanMessage(content=synthesis_prompt))
+            llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+            llm_with_tools = llm.bind_tools([SearchKnowledgeBase, GetSystemDiagnostics])
             
-            synthesis_res = await llm.ainvoke(message_list)
-            final_answer = synthesis_res.content
+            # Primary reasoning loop execution pass
+            ai_msg = await llm_with_tools.ainvoke(message_list)
+            
+            final_answer_text = ""
+            executed_tools_list = []
 
-        # 5. Commit State Changes: Save the current exchange logs down to PostgreSQL
-        user_log = models.ChatMessage(session_id=payload.session_id, role="user", content=payload.user_prompt)
-        agent_log = models.ChatMessage(session_id=payload.session_id, role="model", content=final_answer)
-        
-        db.add(user_log)
-        db.add(agent_log)
-        await db.commit()
+            # 3. Dynamic Tool Branch Routing
+            if ai_msg.tool_calls:
+                tool_results = []
+                for tool_call in ai_msg.tool_calls:
+                    tool_name = tool_call["name"]
+                    tool_args = tool_call["args"]
+                    executed_tools_list.append(tool_name)
+                    
+                    # Notify the frontend UI exactly which system capability is being engaged
+                    yield f"data: {json.dumps({'event': 'tool_start', 'tool': tool_name, 'message': f'Executing background system tool: {tool_name}'})}\n\n"
+                    
+                    if tool_name == "SearchKnowledgeBase":
+                        embeddings_engine = GoogleGenerativeAIEmbedembeddings(
+                            model="models/gemini-embedding-001",
+                            output_dimensionality=768
+                        )
+                        query_vector = embeddings_engine.embed_query(tool_args["query"])
+                        
+                        vector_stmt = (
+                            select(models.KnowledgeChunk)
+                            .order_by(models.KnowledgeChunk.embedding.cosine_distance(query_vector))
+                            .limit(3)
+                        )
+                        vector_res = await db.execute(vector_stmt)
+                        matched_chunks = vector_res.scalars().all()
+                        
+                        context_text = "\n---\n".join([c.content for c in matched_chunks]) if matched_chunks else "No content found."
+                        tool_results.append(f"Tool [SearchKnowledgeBase] Output:\n{context_text}")
+                        
+                    elif tool_name == "GetSystemDiagnostics":
+                        try:
+                            res = await db.execute(text("SELECT extname FROM pg_extension WHERE extname = 'vector';"))
+                            ext = res.scalar()
+                            status = f"Active connected. pgvector status: {ext}"
+                        except Exception as e:
+                            status = f"Database connectivity error: {str(e)}"
+                        tool_results.append(f"Tool [GetSystemDiagnostics] Output: {status}")
 
-        return {
-            "session_id": payload.session_id,
-            "response_source": response_source,
-            "executed_tools": executed_tools_list,
-            "answer": final_answer
-        }
-        
-    except Exception as e:
-        await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Agent Stateful Reasoning Core Breakout: {str(e)}")
+                    yield f"data: {json.dumps({'event': 'tool_end', 'tool': tool_name})}\n\n"
 
+                # Inject tool tracking observations into synthesis prompt sequence
+                combined_tool_context = "\n\n".join(tool_results)
+                synthesis_prompt = (
+                    f"Executed Tool Telemetry Output blocks:\n{combined_tool_context}\n\n"
+                    "Synthesize your final comprehensive answer now based on this output and the thread context."
+                )
+                message_list.append(AIMessage(content=f"[System Executed Tools: {executed_tools_list}]"))
+                message_list.append(HumanMessage(content=synthesis_prompt))
 
+            # 4. Asynchronous Token Generation Pass
+            yield f"data: {json.dumps({'event': 'status', 'message': 'Generating final response...'})}\n\n"
+            
+            # Switch loop to astream chunk generation to extract tokens live
+            async for chunk in llm.astream(message_list):
+                if chunk.content:
+                    final_answer_text += chunk.content
+                    # Yield raw string token fragments immediately to the client network pipe
+                    yield f"data: {json.dumps({'event': 'token', 'text': chunk.content})}\n\n"
+
+            # 5. Post-Stream Memory Log Persistence
+            user_log = models.ChatMessage(session_id=payload.session_id, role="user", content=payload.user_prompt)
+            agent_log = models.ChatMessage(models.ChatMessage(session_id=payload.session_id, role="model", content=final_answer_text))
+            
+            db.add(user_log)
+            db.add(agent_log)
+            await db.commit()
+            
+            # Sign off connection cleanly
+            yield f"data: {json.dumps({'event': 'done', 'session_id': payload.session_id})}\n\n"
+
+        except Exception as e:
+            await db.rollback()
+            yield f"data: {json.dumps({'event': 'error', 'detail': f'Streaming Pipeline Breakout: {str(e)}'})}\n\n"
+
+    # Return structural content stream interface back to the server gateway
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
