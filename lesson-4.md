@@ -2,12 +2,12 @@
 
 #### The Architectural "Why"
 
-In Lesson 3, we successfully set up our multi-container PostgreSQL database with the native `pgvector` extension. Now, we will implement **Retrieval-Augmented Generation (RAG)** to connect your FastAPI server and Google's Gemini model to private, domain-specific technical knowledge.
+In Lesson 3, we successfully set up our multi-container PostgreSQL database with the native `pgvector` extension. Now, we will implement **Retrieval-Augmented Generation (RAG)** to connect your FastAPI server and Google's Gemini model to private, domain-specific technical knowledge (such as resumes, internal documentation, or codebases).
 
-An LLM's static knowledge is frozen at its last training cutoff date, and it has no inherent awareness of private engineering files, internal company codebases, or proprietary API documentations. RAG solves this by implementing a two-phase architecture:
+An LLM's static knowledge is frozen at its last training cutoff date. RAG solves this by implementing an updated, production-grade two-phase architecture using the latest production models:
 
-1. **The Ingestion Pipeline:** Breaks large technical files into smaller semantic chunks, transforms those chunks into high-dimensional floating-point arrays called **Embeddings** using Google's embedding model, and saves them directly into a vectorized PostgreSQL table.
-2. **The Retrieval Pipeline:** When a user queries your API, the server turns that query into a live embedding vector, runs a lightning-fast mathematical **Cosine Similarity** calculation inside the database kernel to isolate the top relevant chunks, and drops those exact facts directly into the LLM's system prompt. This guarantees that Gemini's answers are fully grounded in accurate technical data, entirely eliminating random hallucinations.
+1. **The Ingestion Pipeline:** Breaks large technical files or binary PDF uploads into smaller semantic chunks, transforms those chunks into high-dimensional floating-point arrays called **Embeddings** using Google's active `gemini-embedding-001` model, and saves them directly into a vectorized PostgreSQL table. To remain compatible with standard database schemas without sacrificing performance, we leverage **Matryoshka Representation Learning (MRL)** to safely compress the vectors down to 768 dimensions natively at the API boundary.
+2. **The Retrieval Pipeline:** When a user queries your API, the server turns that query into a live embedding vector using the exact same dimensionality constraints, runs a mathematical **Cosine Similarity** calculation inside the database kernel to isolate the top relevant chunks, and drops those exact facts directly into the high-performance `gemini-2.5-flash` system prompt.
 
 ---
 
@@ -15,29 +15,30 @@ An LLM's static knowledge is frozen at its last training cutoff date, and it has
 
 | Phase Sequence | Engine | Structural Mechanism | Technical Objective |
 | --- | --- | --- | --- |
-| **1. Ingestion Phase** | `langchain-google-genai` | Text splitters slice data $\rightarrow$ `text-embedding-004` generates 768-dimensional float vectors. | Converts unstructured text blocks into mathematically indexable coordinates. |
-| **2. Storage Phase** | `SQLAlchemy 2.0` + `pgvector` | Native SQL inserts execute over an asynchronous pipeline. | Saves raw text and vectors side-by-side inside the database kernel. |
-| **3. Vector Retrieval** | `pgvector` operator (`<->` or `<=>`) | Executes an optimized Cosine Distance query across database indices. | Pulls the top $N$ most semantically relevant text fragments matching the client query. |
-| **4. Grounded Synthesis** | FastAPI + Gemini | Context injection compiles live text fragments straight into the prompt template. | Forces Gemini to respond strictly using the retrieved database facts. |
+| **1. Text/PDF Ingestion** | `pypdf` + `python-multipart` | Extracts raw binary streams from file uploads and handles page-by-page paragraph grouping. | Prepares raw documents for tokenization and vector processing. |
+| **2. Ingestion Embedding** | `GoogleGenerativeAIEmbeddings` | Text splitters slice data $\rightarrow$ `gemini-embedding-001` generates stabilized 768-dimensional float vectors. | Converts unstructured text blocks into mathematically indexable coordinates. |
+| **3. Storage Phase** | `SQLAlchemy 2.0` + `pgvector` | Native SQL inserts execute over an asynchronous pipeline. | Saves raw text and vectors side-by-side inside the database kernel. |
+| **4. Vector Retrieval** | `pgvector` operator (`<=>`) | Executes an optimized Cosine Distance query across database indices. | Pulls the top $N$ most semantically relevant text fragments matching the client query. |
+| **5. Grounded Synthesis** | FastAPI + Gemini | Context injection compiles live text fragments straight into the prompt template. | Forces `gemini-2.5-flash` to respond strictly using the retrieved database facts. |
 
 ---
 
 ### Step 1: Upgrading Dependencies
 
-To allow SQLAlchemy to map native vector column data types inside Python, we must append the `pgvector` partner package to our service environment dependencies.
-
-Update your **`requirements.txt`** file to append the `pgvector` python utility library:
+To support native vector handling alongside real-time multi-part binary file uploads (like PDF resumes), update your **`requirements.txt`** file to match this stabilized version matrix:
 
 ```text
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 langchain-core>=0.3.0
-langchain-google-genai>=1.0.0
+langchain-google-genai>=1.0.1
 pydantic>=2.0.0
 asyncpg>=0.29.0
 sqlalchemy>=2.0.0
 greenlet>=3.0.0
 pgvector>=0.2.0
+pypdf>=4.0.0
+python-multipart>=0.0.9
 
 ```
 
@@ -45,7 +46,7 @@ pgvector>=0.2.0
 
 ### Step 2: Defining the Database Schema Model
 
-Create a new file in your backend folder named **`models.py`**. This script imports our central declarative base and explicitly defines how database columns map down to actual text elements and mathematical vector fields. We will configure it for 768 dimensions, which perfectly matches Google's modern `text-embedding-004` model layout.
+Create a new file in your backend folder named **`models.py`**. This script explicitly defines how database columns map down to actual text elements and mathematical vector fields. We configure the vector field for **768 dimensions**, matching our embedding engine configuration.
 
 ```python
 from sqlalchemy import Column, Integer, Text, String
@@ -59,7 +60,7 @@ class KnowledgeChunk(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     content = Column(Text, nullable=False)
     source_file = Column(String(255), nullable=True)
-    # Google's text-embedding-004 model generates vectors with exactly 768 dimensions
+    # Target dimensionality locked to 768 using Matryoshka compression flags
     embedding = Column(Vector(768), nullable=False)
 
 ```
@@ -68,22 +69,22 @@ class KnowledgeChunk(Base):
 
 ### Step 3: Updating `main.py` for Model Discovery
 
-To ensure that SQLAlchemy discovers our table schema definition and automatically initializes the database tables inside Postgres when the container boots up, we must import `models` right inside our main routing gateway.
-
-Open **`main.py`** and alter the top imports and your `startup_event` routine to reflect this specific configuration block:
+Open **`main.py`** and ensure your top import statements reflect the correct LangChain Google integration classes, and that your `startup_event` routine builds the extensions inside Postgres during container initialization.
 
 ```python
 import os
-from fastapi import FastAPI, HTTPException, Depends
+import io
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from sqlalchemy import text, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from pypdf import PdfReader
 
 from database import engine, Base, get_db
-import models  # <--- CRITICAL: Registers models into SQLAlchemy's global compilation metadata
+import models  # Registers models into SQLAlchemy's global compilation metadata
 
 app = FastAPI(title="Agentic AI Backend - RAG Engine", version="1.2.0")
 
@@ -103,23 +104,19 @@ async def startup_event():
         # Automatically compile and construct tables mapped via SQLAlchemy models
         await conn.run_sync(Base.metadata.create_all)
 
-# Keep your existing endpoints (/health, /db-test, etc.) below this...
-
 ```
 
 ---
 
-### Step 4: Injecting Ingestion & RAG Query Routes
+### Step 4: Injecting Ingestion, PDF Processing, & RAG Query Routes
 
-Now, let's build the operational RAG pipelines. We will append two new endpoints to the bottom of your **`main.py`** file:
-
-1. `/ingest-knowledge`: An endpoint that accepts technical documents, passes them to Google's embedding model, and saves them into PostgreSQL.
-2. `/rag-ask`: An endpoint that executes a live vector query and passes the context to Gemini for a grounded answer.
-
-Append the following code to the bottom of your **`main.py`**:
+Append the complete, updated Pydantic validation schemas and operational RAG pipelines to the bottom of your **`main.py`**:
 
 ```python
-# Pydantic validation schemas for data transfer boundaries
+# =====================================================================
+# PHASE 3: ADVANCED RAG (INGESTION & RETRIEVAL) ROUTING
+# =====================================================================
+
 class KnowledgeIngestionRequest(BaseModel):
     content: str = Field(..., description="The raw technical text or documentation content to ingest.")
     source_file: Optional[str] = Field("manual.txt", description="The origin source name of the document.")
@@ -130,23 +127,20 @@ class RAGQueryRequest(BaseModel):
 
 @app.post("/ingest-knowledge")
 async def ingest_knowledge(payload: KnowledgeIngestionRequest, db: AsyncSession = Depends(get_db)):
-    """Ingestion Engine: Converts plain technical text into vectors and saves it to PostgreSQL."""
+    """Ingestion Engine: Converts plain technical text chunks into 768-dimension vectors and saves them."""
     try:
-        # Initialize Google GenAI Embedding model instances natively
-        embeddings_engine = GoogleGenAIEmbeddings(model="models/text-embedding-004")
+        embeddings_engine = GoogleGenerativeAIEmbeddings(
+            model="models/gemini-embedding-001",
+            output_dimensionality=768
+        )
         
-        # Simple strategic semantic paragraph chunking
         chunks = [chunk.strip() for chunk in payload.content.split("\n\n") if chunk.strip()]
         
         if not chunks:
             raise HTTPException(status_code=400, detail="No valid text chunks discovered in payload.")
 
-        # Batch compute embeddings over the external network boundary
-        # Note: LangChain's current embeddings object wraps synchronous network calls under the hood,
-        # so we run it directly while keeping our database transactions strictly asynchronous.
         vectors = embeddings_engine.embed_documents(chunks)
 
-        # Map chunks and vectors side-by-side into model entities
         for chunk_text, vector in zip(chunks, vectors):
             db_chunk = models.KnowledgeChunk(
                 content=chunk_text,
@@ -163,17 +157,58 @@ async def ingest_knowledge(payload: KnowledgeIngestionRequest, db: AsyncSession 
         raise HTTPException(status_code=500, detail=f"Knowledge ingestion breakdown: {str(e)}")
 
 
+@app.post("/ingest-pdf-file")
+async def ingest_pdf_file(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
+    """Binary File Ingestion Engine: Extracts actual text from uploaded PDFs, vectorizes, and saves it."""
+    try:
+        file_content = await file.read()
+        pdf_reader = PdfReader(io.BytesIO(file_content))
+        
+        extracted_text = ""
+        for page in pdf_reader.pages:
+            text_content = page.extract_text()
+            if text_content:
+                extracted_text += text_content + "\n\n"
+        
+        chunks = [chunk.strip() for chunk in extracted_text.split("\n\n") if chunk.strip()]
+        
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No readable text could be extracted from the PDF file.")
+            
+        embeddings_engine = GoogleGenerativeAIEmbeddings(
+            model="models/gemini-embedding-001",
+            output_dimensionality=768
+        )
+        
+        vectors = embeddings_engine.embed_documents(chunks)
+
+        for chunk_text, vector in zip(chunks, vectors):
+            db_chunk = models.KnowledgeChunk(
+                content=chunk_text,
+                source_file=file.filename,
+                embedding=vector
+            )
+            db.add(db_chunk)
+            
+        await db.commit()
+        return {"status": "success", "inserted_chunks": len(chunks), "filename": file.filename}
+        
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"PDF parsing or ingestion failed: {str(e)}")
+
+
 @app.post("/rag-ask")
 async def rag_ask_question(payload: RAGQueryRequest, db: AsyncSession = Depends(get_db)):
-    """Retrieval-Augmented Query Engine: Extracts context via vector math and forces a grounded response."""
+    """Retrieval-Augmented Query Engine: Syncs query vector layouts and forces a grounded response via Gemini 2.5."""
     try:
-        embeddings_engine = GoogleGenAIEmbeddings(model="models/text-embedding-004")
+        embeddings_engine = GoogleGenerativeAIEmbeddings(
+            model="models/gemini-embedding-001",
+            output_dimensionality=768
+        )
         
-        # 1. Transform client question text string into a single embedding vector match array
         query_vector = embeddings_engine.embed_query(payload.question)
 
-        # 2. Execute an asynchronous Cosine Distance vector lookup query inside the database kernel
-        # The .cosine_distance() function uses the specialized pgvector <=> math operator under the hood
         stmt = (
             select(models.KnowledgeChunk)
             .order_by(models.KnowledgeChunk.embedding.cosine_distance(query_vector))
@@ -185,11 +220,9 @@ async def rag_ask_question(payload: RAGQueryRequest, db: AsyncSession = Depends(
         if not matched_chunks:
             return {"answer": "No technical documentation has been ingested into the memory store yet.", "context_used": []}
 
-        # 3. Consolidate extracted rows into a unified context block
         context_block = "\n---\n".join([chunk.content for chunk in matched_chunks])
         context_sources = [chunk.source_file for chunk in matched_chunks]
 
-        # 4. Compile a highly defensive system prompt targeting absolute grounding
         system_prompt = (
             "You are an elite enterprise software systems engineer expert.\n"
             "Answer the user's question using ONLY the verified documentation context blocks provided below.\n"
@@ -198,8 +231,7 @@ async def rag_ask_question(payload: RAGQueryRequest, db: AsyncSession = Depends(
             f"User Question: {payload.question}"
         )
 
-        # 5. Route the prompt payload straight out to the high-performance Gemini model
-        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.1)
+        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1)
         response = await llm.ainvoke(system_prompt)
 
         return {
@@ -217,15 +249,36 @@ async def rag_ask_question(payload: RAGQueryRequest, db: AsyncSession = Depends(
 
 ### Actionable Task
 
-1. Save the updated versions of `requirements.txt` and `main.py`, and create the new `models.py` file inside your working project directory.
-2. Force a clean build to install the new `pgvector` library package and re-orchestrate the application state matrix:
+1. Save the updated versions of `requirements.txt`, `main.py`, and your `models.py` file inside your workspace directory.
+2. Force a clean image rebuild to install `pypdf` and `python-multipart` into your API container environment:
+
 ```bash
 docker compose down --volumes
-docker compose up --build
+docker compose up --build -d
 
 ```
 
+3. Open your terminal logs (`docker compose logs api -f`) and verify that your system successfully launches with the text: `Application startup complete.`
 
-3. Verify that your containers boot up cleanly and show that `api-1` successfully finishes application startup initialization routines.
+Once your logs confirm the system is online, respond back with **Finished**. We will then proceed to test your live endpoints by uploading your technical resume directly through the brand new file system layer!
 
-Once the application is live, report back with **Finished**. In the next turn, we will run deep network verification steps by feeding our system mock enterprise documentation and observing how it utilizes vector distance calculations to answer questions!
+
+# # Problems and it's solution
+
+Here is the comprehensive summary of all the technical issues encountered during the implementation and testing of Lesson 4, along with their root causes and structural solutions.
+
+### Lesson 4 Troubleshooting & Resolution Log
+
+| # | Error / Problem Symptom | Root Cause | Provided Solution / Action Item |
+| --- | --- | --- | --- |
+| **1** | `curl: (56) Recv failure: Connection reset by peer` | The FastAPI/Uvicorn backend server process crashed abruptly mid-request, causing the network socket to drop before returning an HTTP response. | Run `docker compose logs api --tail=50` to inspect the container trace. Verify that environment variables (`GEMINI_API_KEY`) are bound correctly in `docker-compose.yml`, and restart port states via `docker compose down && docker compose up --build -d`. |
+| **2** | `404 NOT_FOUND` for `models/text-embedding-004` during knowledge ingestion. | The legacy `text-embedding-004` model was permanently deprecated and decommissioned by Google, causing endpoint network failures. | Migrated the embedding engine to an active model (`models/gemini-embedding-001`). Because the new model defaults to 3072 dimensions while your database was built for 768, we explicitly passed `output_dimensionality=768` to employ Matryoshka Representation Learning and prevent database schema errors. |
+| **3** | `500 Internal Server Error` stating: `name 'GoogleGenAIEmbeddings' is not defined` | A Python `NameError` inside the `/rag-ask` endpoint. The code attempted to instantiate a class that was either not imported or mistyped. | Corrected the class name to LangChain's official Google registry format: **`GoogleGenerativeAIEmbeddings`**. Updated both the top imports and the instantiation lines inside `/ingest-knowledge` and `/rag-ask`. |
+| **4** | `404 NOT_FOUND` for `models/gemini-1.5-flash` inside the `/rag-ask` endpoint. | A model version discrepancy. The Phase 1 route (`/extract-features`) was updated to use `gemini-2.5-flash`, but the Phase 3 route (`/rag-ask`) was still pointing to the deprecated `gemini-1.5-flash` engine. | Updated the LLM initialization layer inside the `/rag-ask` endpoint at the bottom of `main.py` to target the active model: `ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1)`. |
+| **5** | RAG pipeline fails to return resume skills; returns empty or non-applicable context blocks. | Conceptual mismatch. Passing a string like `"Adjustable Resume- Shaun Hossain.pdf"` in a standard text payload only stores that string as metadata. The system had no logic to access, open, or read the local binary file context. | Implemented a structural backend upgrade: Installed the `pypdf` parsing engine and coded a dedicated **`/ingest-pdf-file`** endpoint that accepts an `UploadFile` stream, extracts text dynamically page-by-page, and pushes the generated chunks into the vector store. |
+| **6** | `RuntimeError: Form data requires "python-multipart" to be installed.` (Container crashes on startup). | FastAPI handles incoming file streams utilizing the standard `multipart/form-data` encoding. To parse this, it requires the external package `python-multipart`, which was missing from the image environment. | Appended `python-multipart>=0.0.9` and `pypdf>=4.0.0` directly to the `requirements.txt` file. Executed a clean cache wipe and cluster rebuild using `docker compose down && docker compose up --build -d` to securely bake the packages into the application layer. |
+
+### Golden Rules for Future Reference
+
+1. **Dimension Matching:** Whenever you alter an embedding model configuration, ensure the `output_dimensionality` on the query side (`/rag-ask`) matches the exact vector size configuration of the ingestion side (`/ingest-knowledge`), as well as your PostgreSQL database column configuration.
+2. **Context Isolation:** If your RAG pipeline states it cannot find an answer, always trace the database layer first using SQL in pgAdmin (`SELECT * FROM knowledge_chunks;`) to verify that the raw text chunks actually exist inside the kernel storage layer.

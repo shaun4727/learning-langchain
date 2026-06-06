@@ -2,11 +2,15 @@ import os
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional  # <--- FIXED: Added Optional
+from typing import List, Optional 
+
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from database import engine, Base, get_db
-from sqlalchemy import text, select  # <--- FIXED: Added select
+from sqlalchemy import text, select 
 from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import UploadFile, File
+from pypdf import PdfReader
+import io
 
 import models
 
@@ -98,40 +102,60 @@ class RAGQueryRequest(BaseModel):
     question: str = Field(..., description="The technical question you want to ask the grounded LLM model.")
 
 
-@app.post("/ingest-knowledge")
-async def ingest_knowledge(payload: KnowledgeIngestionRequest, db: AsyncSession = Depends(get_db)):
-    """Ingestion Engine: Converts plain technical text into vectors and saves it to PostgreSQL."""
+
+
+@app.post("/ingest-pdf-file")
+async def ingest_pdf_file(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
     try:
-        embeddings_engine = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+        # 1. Read the raw binary stream of the uploaded file into memory
+        file_content = await file.read()
+        pdf_reader = PdfReader(io.BytesIO(file_content))
         
-        chunks = [chunk.strip() for chunk in payload.content.split("\n\n") if chunk.strip()]
+        # 2. Extract text from all pages of the PDF document
+        extracted_text = ""
+        for page in pdf_reader.pages:
+            text_content = page.extract_text()
+            if text_content:
+                extracted_text += text_content + "\n\n"
+        
+        # 3. Use your existing logic to split text into chunks
+        chunks = [chunk.strip() for chunk in extracted_text.split("\n\n") if chunk.strip()]
         
         if not chunks:
-            raise HTTPException(status_code=400, detail="No valid text chunks discovered in payload.")
-
+            raise HTTPException(status_code=400, detail="No readable text could be extracted from the PDF.")
+            
+        embeddings_engine = GoogleGenerativeAIEmbeddings(
+            model="models/gemini-embedding-001",
+            output_dimensionality=768
+        )
+        
         vectors = embeddings_engine.embed_documents(chunks)
 
         for chunk_text, vector in zip(chunks, vectors):
             db_chunk = models.KnowledgeChunk(
                 content=chunk_text,
-                source_file=payload.source_file,
+                source_file=file.filename, # Automatically grabs the actual file name
                 embedding=vector
             )
             db.add(db_chunk)
             
         await db.commit()
-        return {"status": "success", "inserted_chunks": len(chunks)}
+        return {"status": "success", "inserted_chunks": len(chunks), "filename": file.filename}
         
     except Exception as e:
         await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Knowledge ingestion breakdown: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"PDF parsing or ingestion failed: {str(e)}")
 
 
 @app.post("/rag-ask")
 async def rag_ask_question(payload: RAGQueryRequest, db: AsyncSession = Depends(get_db)):
     """Retrieval-Augmented Query Engine: Extracts context via vector math and forces a grounded response."""
     try:
-        embeddings_engine = GoogleGenAIEmbeddings(model="models/text-embedding-004")
+        # FIXED: Updated class name, model target, and dimensionality configuration
+        embeddings_engine = GoogleGenerativeAIEmbeddings(
+            model="models/gemini-embedding-001",
+            output_dimensionality=768
+        )
         
         query_vector = embeddings_engine.embed_query(payload.question)
 
@@ -157,7 +181,7 @@ async def rag_ask_question(payload: RAGQueryRequest, db: AsyncSession = Depends(
             f"User Question: {payload.question}"
         )
 
-        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.1)
+        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1)
         response = await llm.ainvoke(system_prompt)
 
         return {
