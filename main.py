@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import UploadFile, File
 from pypdf import PdfReader
 import io
-
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 import models
 
 app = FastAPI(title="Agentic AI Backend", version="1.2.0")
@@ -207,72 +207,124 @@ class GetSystemDiagnostics(BaseModel):
     """Fetch live infrastructure environment runtime states, database health, and extension configurations."""
     confirm: bool = Field(..., description="Set to True to trigger a live database connection handshake check.")
 
+class AgentChatRequest(BaseModel):
+    session_id: str = Field(..., description="Unique thread identifier tracking a single distinct conversation conversation.")
+    user_prompt: str = Field(..., description="The textual query or follow-up instruction passed to the agent.")
+
 
 @app.post("/agent-chat")
-async def agent_reasoning_engine(user_prompt: str, db: AsyncSession = Depends(get_db)):
-    """Autonomous Agent Endpoint: Dynamically reasons, executes functional code tools, and synthesizes answers."""
+async def agent_reasoning_engine(payload: AgentChatRequest, db: AsyncSession = Depends(get_db)):
+    """Stateful Autonomous Agent: Restores session threads from PostgreSQL, reasons, runs tools, and saves logs."""
     try:
-        # 1. Initialize the core model and bind the structural tool schemas
+        # 1. Hydrate Short-Term Memory: Fetch chronological history for this session thread
+        stmt = (
+            select(models.ChatMessage)
+            .where(models.ChatMessage.session_id == payload.session_id)
+            .order_by(models.ChatMessage.timestamp.asc())
+        )
+        result = await db.execute(stmt)
+        historical_rows = result.scalars().all()
+
+        # 2. Compile Context Message Array for LangChain and Gemini
+        message_list = [
+            SystemMessage(content=(
+                "You are an elite autonomous system agent executing software diagnostic loops.\n"
+                "You have access to historical logs and operational tools to satisfy parameters perfectly.\n"
+                "Review the context of past turns (if any) to address follow-up references cleanly."
+            ))
+        ]
+
+        # Map historical database records directly into structured LangChain message schemas
+        for row in historical_rows:
+            if row.role == "user":
+                message_list.append(HumanMessage(content=row.content))
+            elif row.role == "model":
+                message_list.append(AIMessage(content=row.content))
+
+        # Append the current live user prompt to the very tail of the sequence
+        message_list.append(HumanMessage(content=payload.user_prompt))
+
+        # 3. Initialize reasoning engine and bind existing functional tools
         llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
         llm_with_tools = llm.bind_tools([SearchKnowledgeBase, GetSystemDiagnostics])
         
-        # 2. Execute initial reasoning pass
-        ai_msg = await llm_with_tools.ainvoke(user_prompt)
+        # Execute reasoning pass over the entire historical message block
+        ai_msg = await llm_with_tools.ainvoke(message_list)
         
-        # If the model does not require any tools, return its direct text response immediately
-        if not ai_msg.tool_calls:
-            return {"response_source": "direct_llm", "answer": ai_msg.content}
-            
-        # 3. Process tool directives emitted by the model
-        tool_results = []
-        for tool_call in ai_msg.tool_calls:
-            tool_name = tool_call["name"]
-            tool_args = tool_call["args"]
-            
-            if tool_name == "SearchKnowledgeBase":
-                # Execute the exact vector search logic built in Lesson 4 dynamically
-                embeddings_engine = GoogleGenerativeAIEmbeddings(
-                    model="models/gemini-embedding-001",
-                    output_dimensionality=768
-                )
-                query_vector = embeddings_engine.embed_query(tool_args["query"])
-                
-                stmt = (
-                    select(models.KnowledgeChunk)
-                    .order_by(models.KnowledgeChunk.embedding.cosine_distance(query_vector))
-                    .limit(3)
-                )
-                result = await db.execute(stmt)
-                matched_chunks = result.scalars().all()
-                
-                context_text = "\n---\n".join([c.content for c in matched_chunks]) if matched_chunks else "No content found."
-                tool_results.append(f"Tool [SearchKnowledgeBase] Output:\n{context_text}")
-                
-            elif tool_name == "GetSystemDiagnostics":
-                # Execute live database handshake check dynamically
-                try:
-                    res = await db.execute(text("SELECT extname FROM pg_extension WHERE extname = 'vector';"))
-                    ext = res.scalar()
-                    status = f"Active connected. pgvector status: {ext}"
-                except Exception as e:
-                    status = f"Database connectivity error: {str(e)}"
-                tool_results.append(f"Tool [GetSystemDiagnostics] Output: {status}")
+        final_answer = ""
+        executed_tools_list = []
 
-        # 4. Synthesize final response by feeding tool telemetry back into the model
-        combined_tool_context = "\n\n".join(tool_results)
-        synthesis_prompt = (
-            "You are an elite autonomous system agent executing software diagnostic loops.\n"
-            "You formulated a plan and executed system tools. Review your execution outputs below and write a final, comprehensive answer to the user.\n\n"
-            f"Executed Tool Telemetry:\n{combined_tool_context}\n\n"
-            f"Original User Request: {user_prompt}"
-        )
+        # 4. Handle Operational Tool Execution Logic
+        if not ai_msg.tool_calls:
+            final_answer = ai_msg.content
+            response_source = "direct_llm_with_memory"
+        else:
+            response_source = "agent_tool_execution_with_memory"
+            tool_results = []
+            
+            for tool_call in ai_msg.tool_calls:
+                tool_name = tool_call["name"]
+                tool_args = tool_call["args"]
+                executed_tools_list.append(tool_name)
+                
+                if tool_name == "SearchKnowledgeBase":
+                    embeddings_engine = GoogleGenerativeAIEmbeddings(
+                        model="models/gemini-embedding-001",
+                        output_dimensionality=768
+                    )
+                    query_vector = embeddings_engine.embed_query(tool_args["query"])
+                    
+                    vector_stmt = (
+                        select(models.KnowledgeChunk)
+                        .order_by(models.KnowledgeChunk.embedding.cosine_distance(query_vector))
+                        .limit(3)
+                    )
+                    vector_res = await db.execute(vector_stmt)
+                    matched_chunks = vector_res.scalars().all()
+                    
+                    context_text = "\n---\n".join([c.content for c in matched_chunks]) if matched_chunks else "No content found."
+                    tool_results.append(f"Tool [SearchKnowledgeBase] Output:\n{context_text}")
+                    
+                elif tool_name == "GetSystemDiagnostics":
+                    try:
+                        res = await db.execute(text("SELECT extname FROM pg_extension WHERE extname = 'vector';"))
+                        ext = res.scalar()
+                        status = f"Active connected. pgvector status: {ext}"
+                    except Exception as e:
+                        status = f"Database connectivity error: {str(e)}"
+                    tool_results.append(f"Tool [GetSystemDiagnostics] Output: {status}")
+
+            # Synthesize final answer using the telemetry outputs alongside history
+            combined_tool_context = "\n\n".join(tool_results)
+            synthesis_prompt = (
+                f"Executed Tool Telemetry Output blocks:\n{combined_tool_context}\n\n"
+                "Synthesize your final comprehensive answer now based on this output and the thread context."
+            )
+            
+            # Temporarily append the telemetry results to guide the final pass
+            message_list.append(AIMessage(content=f"[System Executed Tools: {executed_tools_list}]"))
+            message_list.append(HumanMessage(content=synthesis_prompt))
+            
+            synthesis_res = await llm.ainvoke(message_list)
+            final_answer = synthesis_res.content
+
+        # 5. Commit State Changes: Save the current exchange logs down to PostgreSQL
+        user_log = models.ChatMessage(session_id=payload.session_id, role="user", content=payload.user_prompt)
+        agent_log = models.ChatMessage(session_id=payload.session_id, role="model", content=final_answer)
         
-        final_response = await llm.ainvoke(synthesis_prompt)
+        db.add(user_log)
+        db.add(agent_log)
+        await db.commit()
+
         return {
-            "response_source": "agent_tool_execution",
-            "executed_tools": [tc["name"] for tc in ai_msg.tool_calls],
-            "answer": final_response.content
+            "session_id": payload.session_id,
+            "response_source": response_source,
+            "executed_tools": executed_tools_list,
+            "answer": final_answer
         }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Agent Reasoning Core Breakout: {str(e)}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Agent Stateful Reasoning Core Breakout: {str(e)}")
+
+
