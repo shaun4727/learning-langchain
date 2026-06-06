@@ -2,13 +2,15 @@ import os
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List
-from langchain_google_genai import ChatGoogleGenerativeAI
+from typing import List, Optional  # <--- FIXED: Added Optional
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from database import engine, Base, get_db
-from sqlalchemy import text
+from sqlalchemy import text, select  # <--- FIXED: Added select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-app = FastAPI(title="Agentic AI Backend", version="1.0.0")
+import models
+
+app = FastAPI(title="Agentic AI Backend", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,7 +20,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 1. Define the explicit structured model output schema using Pydantic V2
+# =====================================================================
+# PHASE 1: STRUCTURED DATA EXTRACTION SCHEMAS & ROUTES
+# =====================================================================
+
 class TechnicalFeatureExtractor(BaseModel):
     """Schema for extracting technical architectural features from structural logs or project text."""
     programming_languages: List[str] = Field(
@@ -31,39 +36,47 @@ class TechnicalFeatureExtractor(BaseModel):
         description="A clear, single-sentence summary of the core engineering bottleneck or bug described."
     )
 
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "service": "agentic-ai-core"}
 
-# 2. Implement the parsing route using native .with_structured_output()
 @app.post("/extract-features", response_model=TechnicalFeatureExtractor)
 async def extract_features(text_input: str):
     if not os.getenv("GEMINI_API_KEY"):
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY environment variable is missing.")
     
     try:
-        # Initialize the native Google GenAI model instance
         llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
         
-        # Enforce structural boundaries natively at the LLM engine layer
         structured_llm = llm.with_structured_output(
             TechnicalFeatureExtractor, 
             method="json_schema"
         )
         
-        # Execute the schema-guaranteed extraction request asynchronously
         result = await structured_llm.ainvoke(text_input)
         return result
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
 
-# Diagnostic endpoint to verify asynchronous database transaction handshakes
+# =====================================================================
+# PHASE 2: CORE INFRASTRUCTURE LIFECYCLE & DIAGNOSTICS
+# =====================================================================
+
+@app.on_event("startup")
+async def startup_event():
+    async with engine.begin() as conn:
+        # Register pgvector extension inside the core kernel instance
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+        # Automatically compile and construct tables mapped via SQLAlchemy models
+        await conn.run_sync(Base.metadata.create_all)
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "agentic-ai-core"}
+
+
 @app.get("/db-test")
 async def test_database_connection(db: AsyncSession = Depends(get_db)):
     try:
-        # Execute a low-overhead diagnostic query on the async thread pool
         result = await db.execute(text("SELECT extname FROM pg_extension WHERE extname = 'vector';"))
         extension_exists = result.scalar()
         
@@ -72,3 +85,86 @@ async def test_database_connection(db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Database connected but pgvector extension missing.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database handshake failed: {str(e)}")
+
+# =====================================================================
+# PHASE 3: ADVANCED RAG (INGESTION & RETRIEVAL) ROUTING
+# =====================================================================
+
+class KnowledgeIngestionRequest(BaseModel):
+    content: str = Field(..., description="The raw technical text or documentation content to ingest.")
+    source_file: Optional[str] = Field("manual.txt", description="The origin source name of the document.")
+
+class RAGQueryRequest(BaseModel):
+    question: str = Field(..., description="The technical question you want to ask the grounded LLM model.")
+
+
+@app.post("/ingest-knowledge")
+async def ingest_knowledge(payload: KnowledgeIngestionRequest, db: AsyncSession = Depends(get_db)):
+    """Ingestion Engine: Converts plain technical text into vectors and saves it to PostgreSQL."""
+    try:
+        embeddings_engine = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+        
+        chunks = [chunk.strip() for chunk in payload.content.split("\n\n") if chunk.strip()]
+        
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No valid text chunks discovered in payload.")
+
+        vectors = embeddings_engine.embed_documents(chunks)
+
+        for chunk_text, vector in zip(chunks, vectors):
+            db_chunk = models.KnowledgeChunk(
+                content=chunk_text,
+                source_file=payload.source_file,
+                embedding=vector
+            )
+            db.add(db_chunk)
+            
+        await db.commit()
+        return {"status": "success", "inserted_chunks": len(chunks)}
+        
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Knowledge ingestion breakdown: {str(e)}")
+
+
+@app.post("/rag-ask")
+async def rag_ask_question(payload: RAGQueryRequest, db: AsyncSession = Depends(get_db)):
+    """Retrieval-Augmented Query Engine: Extracts context via vector math and forces a grounded response."""
+    try:
+        embeddings_engine = GoogleGenAIEmbeddings(model="models/text-embedding-004")
+        
+        query_vector = embeddings_engine.embed_query(payload.question)
+
+        stmt = (
+            select(models.KnowledgeChunk)
+            .order_by(models.KnowledgeChunk.embedding.cosine_distance(query_vector))
+            .limit(3)
+        )
+        result = await db.execute(stmt)
+        matched_chunks = result.scalars().all()
+
+        if not matched_chunks:
+            return {"answer": "No technical documentation has been ingested into the memory store yet.", "context_used": []}
+
+        context_block = "\n---\n".join([chunk.content for chunk in matched_chunks])
+        context_sources = [chunk.source_file for chunk in matched_chunks]
+
+        system_prompt = (
+            "You are an elite enterprise software systems engineer expert.\n"
+            "Answer the user's question using ONLY the verified documentation context blocks provided below.\n"
+            "If the context does not contain the answer, state clearly that the documentation does not cover this topic.\n\n"
+            f"--- START SYSTEM VERIFIED CONTEXT ---\n{context_block}\n--- END SYSTEM VERIFIED CONTEXT ---\n\n"
+            f"User Question: {payload.question}"
+        )
+
+        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.1)
+        response = await llm.ainvoke(system_prompt)
+
+        return {
+            "answer": response.content,
+            "context_sources": list(set(context_sources)),
+            "retrieved_fragments_count": len(matched_chunks)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"RAG processing pipeline failure: {str(e)}")
