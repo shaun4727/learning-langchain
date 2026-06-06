@@ -192,3 +192,87 @@ async def rag_ask_question(payload: RAGQueryRequest, db: AsyncSession = Depends(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"RAG processing pipeline failure: {str(e)}")
+    
+
+
+# =====================================================================
+# PHASE 4: AUTONOMOUS AGENT LAYER & TOOL DEFINITIONS
+# =====================================================================
+
+class SearchKnowledgeBase(BaseModel):
+    """Search the vectorized system knowledge store for engineering documentation, skills, projects, or resume details."""
+    query: str = Field(..., description="The semantic search query targeting historical document fragments.")
+
+class GetSystemDiagnostics(BaseModel):
+    """Fetch live infrastructure environment runtime states, database health, and extension configurations."""
+    confirm: bool = Field(..., description="Set to True to trigger a live database connection handshake check.")
+
+
+@app.post("/agent-chat")
+async def agent_reasoning_engine(user_prompt: str, db: AsyncSession = Depends(get_db)):
+    """Autonomous Agent Endpoint: Dynamically reasons, executes functional code tools, and synthesizes answers."""
+    try:
+        # 1. Initialize the core model and bind the structural tool schemas
+        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+        llm_with_tools = llm.bind_tools([SearchKnowledgeBase, GetSystemDiagnostics])
+        
+        # 2. Execute initial reasoning pass
+        ai_msg = await llm_with_tools.ainvoke(user_prompt)
+        
+        # If the model does not require any tools, return its direct text response immediately
+        if not ai_msg.tool_calls:
+            return {"response_source": "direct_llm", "answer": ai_msg.content}
+            
+        # 3. Process tool directives emitted by the model
+        tool_results = []
+        for tool_call in ai_msg.tool_calls:
+            tool_name = tool_call["name"]
+            tool_args = tool_call["args"]
+            
+            if tool_name == "SearchKnowledgeBase":
+                # Execute the exact vector search logic built in Lesson 4 dynamically
+                embeddings_engine = GoogleGenerativeAIEmbeddings(
+                    model="models/gemini-embedding-001",
+                    output_dimensionality=768
+                )
+                query_vector = embeddings_engine.embed_query(tool_args["query"])
+                
+                stmt = (
+                    select(models.KnowledgeChunk)
+                    .order_by(models.KnowledgeChunk.embedding.cosine_distance(query_vector))
+                    .limit(3)
+                )
+                result = await db.execute(stmt)
+                matched_chunks = result.scalars().all()
+                
+                context_text = "\n---\n".join([c.content for c in matched_chunks]) if matched_chunks else "No content found."
+                tool_results.append(f"Tool [SearchKnowledgeBase] Output:\n{context_text}")
+                
+            elif tool_name == "GetSystemDiagnostics":
+                # Execute live database handshake check dynamically
+                try:
+                    res = await db.execute(text("SELECT extname FROM pg_extension WHERE extname = 'vector';"))
+                    ext = res.scalar()
+                    status = f"Active connected. pgvector status: {ext}"
+                except Exception as e:
+                    status = f"Database connectivity error: {str(e)}"
+                tool_results.append(f"Tool [GetSystemDiagnostics] Output: {status}")
+
+        # 4. Synthesize final response by feeding tool telemetry back into the model
+        combined_tool_context = "\n\n".join(tool_results)
+        synthesis_prompt = (
+            "You are an elite autonomous system agent executing software diagnostic loops.\n"
+            "You formulated a plan and executed system tools. Review your execution outputs below and write a final, comprehensive answer to the user.\n\n"
+            f"Executed Tool Telemetry:\n{combined_tool_context}\n\n"
+            f"Original User Request: {user_prompt}"
+        )
+        
+        final_response = await llm.ainvoke(synthesis_prompt)
+        return {
+            "response_source": "agent_tool_execution",
+            "executed_tools": [tc["name"] for tc in ai_msg.tool_calls],
+            "answer": final_response.content
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent Reasoning Core Breakout: {str(e)}")
