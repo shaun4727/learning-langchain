@@ -3,15 +3,12 @@ services:
     build: .
     ports:
       - "8000:8000"
-    volumes:
-      - .:/app
-    env_file:
-      - .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:12345678@db:5432/agentic_vector_store
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     depends_on:
       db:
         condition: service_healthy
-    networks:
-      - agentic_network
 
   db:
     image: pgvector/pgvector:pg16

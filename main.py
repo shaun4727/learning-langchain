@@ -1,7 +1,8 @@
 import os
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+import re
 from typing import List, Optional 
 
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
@@ -209,9 +210,40 @@ class GetSystemDiagnostics(BaseModel):
     """Fetch live infrastructure environment runtime states, database health, and extension configurations."""
     confirm: bool = Field(..., description="Set to True to trigger a live database connection handshake check.")
 
+
+
 class AgentChatRequest(BaseModel):
-    session_id: str = Field(..., description="Unique thread identifier tracking a single distinct conversation conversation.")
+    """Stateful payload structure tracking an ongoing conversational thread with strict security guardrails."""
+    session_id: str = Field(..., description="Unique thread identifier tracking a single distinct conversation.")
     user_prompt: str = Field(..., description="The textual query or follow-up instruction passed to the agent.")
+
+    @field_validator("user_prompt")
+    @classmethod
+    def apply_agentic_guardrails(cls, value: str) -> str:
+        """Production Security Guardrail: Scans incoming prompt buffers for malicious system override vectors."""
+        cleaned_value = value.strip()
+        
+        # 1. Define typical prompt injection and jailbreak attack phrases
+        injection_patterns = [
+            r"ignore\s+(all\s+)?previous\s+instructions",
+            r"system\s+override",
+            r"you\s+are\s+now\s+a\s+malicious",
+            r"bypass\s+restrictions",
+            r"reveal\s+(your\s+)?system\s+prompt"
+        ]
+        
+        # Check for injection signatures
+        for pattern in injection_patterns:
+            if re.search(pattern, cleaned_value.lower()):
+                raise ValueError("Security Access Violation: Unauthorized system override signature detected.")
+                
+        # 2. Block system command attempts inside the text buffer
+        destructive_keywords = ["rm -rf", "sudo ", "drop table", "delete from chat_history"]
+        for keyword in destructive_keywords:
+            if keyword in cleaned_value.lower():
+                raise ValueError("Security Access Violation: Prohibited database or operating system command signature detected.")
+                
+        return cleaned_value
 
 
 @app.post("/agent-chat")
