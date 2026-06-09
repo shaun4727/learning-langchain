@@ -46,4 +46,5 @@ USER appuser
 EXPOSE 8000
 
 # Fire up Gunicorn managing asynchronous multi-core scaling workers
-CMD ["gunicorn", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "main:app"]
+# Fire up Gunicorn with 1 worker optimized for 1-CPU environments, and push the timeout to 2 minutes
+CMD ["gunicorn", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "--timeout", "120", "main:app"]
