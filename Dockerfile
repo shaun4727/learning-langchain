@@ -11,9 +11,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Generate isolated local Python dependency wheels
+# Create an isolated virtual environment structure
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # =====================================================================
 # STAGE 2: HARDENED RUNTIME ENVIRONMENT
@@ -27,19 +30,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy python packages compiled in the builder stage
-COPY --from=builder /root/.local /root/.local
+# Copy the entire standalone virtual environment from the builder stage
+COPY --from=builder /opt/venv /opt/venv
 COPY . /app
 
-ENV PATH=/root/.local/bin:$PATH
+# Route system execution paths straight through the virtual environment
+ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 
-# Create a limited privilege system account to run the application
+# Create a limited privilege account and grant explicit ownership of app + venv
 RUN useradd -u 1001 -m appuser && \
-    chown -R appuser:appuser /app
+    chown -R appuser:appuser /app /opt/venv
 USER appuser
 
 EXPOSE 8000
 
-# Fire up Gunicorn managing Uvicorn workers for asynchronous multi-core scaling
+# Fire up Gunicorn managing asynchronous multi-core scaling workers
 CMD ["gunicorn", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "main:app"]
