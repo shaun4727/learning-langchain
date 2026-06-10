@@ -1,27 +1,28 @@
 import os
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 import re
 from typing import List, Optional 
+import io
+import json
 
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from database import engine, Base, get_db
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from fastapi.responses import StreamingResponse
 from sqlalchemy import text, select 
 from sqlalchemy.ext.asyncio import AsyncSession
-from fastapi import UploadFile, File
 from pypdf import PdfReader
-import io
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+
+from database import engine, Base, get_db
 import models
-import json
-from fastapi.responses import StreamingResponse
 
 app = FastAPI(title="Agentic AI Backend", version="1.2.0")
 
+# Updated origins to allow seamless integration both locally and globally
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"], 
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -105,8 +106,6 @@ class RAGQueryRequest(BaseModel):
     question: str = Field(..., description="The technical question you want to ask the grounded LLM model.")
 
 
-
-
 @app.post("/ingest-pdf-file")
 async def ingest_pdf_file(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
     try:
@@ -121,7 +120,7 @@ async def ingest_pdf_file(file: UploadFile = File(...), db: AsyncSession = Depen
             if text_content:
                 extracted_text += text_content + "\n\n"
         
-        # 3. Use your existing logic to split text into chunks
+        # 3. Split text into chunks
         chunks = [chunk.strip() for chunk in extracted_text.split("\n\n") if chunk.strip()]
         
         if not chunks:
@@ -137,7 +136,7 @@ async def ingest_pdf_file(file: UploadFile = File(...), db: AsyncSession = Depen
         for chunk_text, vector in zip(chunks, vectors):
             db_chunk = models.KnowledgeChunk(
                 content=chunk_text,
-                source_file=file.filename, # Automatically grabs the actual file name
+                source_file=file.filename,
                 embedding=vector
             )
             db.add(db_chunk)
@@ -154,7 +153,6 @@ async def ingest_pdf_file(file: UploadFile = File(...), db: AsyncSession = Depen
 async def rag_ask_question(payload: RAGQueryRequest, db: AsyncSession = Depends(get_db)):
     """Retrieval-Augmented Query Engine: Extracts context via vector math and forces a grounded response."""
     try:
-        # FIXED: Updated class name, model target, and dimensionality configuration
         embeddings_engine = GoogleGenerativeAIEmbeddings(
             model="models/gemini-embedding-001",
             output_dimensionality=768
@@ -195,7 +193,6 @@ async def rag_ask_question(payload: RAGQueryRequest, db: AsyncSession = Depends(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"RAG processing pipeline failure: {str(e)}")
-    
 
 
 # =====================================================================
@@ -211,7 +208,6 @@ class GetSystemDiagnostics(BaseModel):
     confirm: bool = Field(..., description="Set to True to trigger a live database connection handshake check.")
 
 
-
 class AgentChatRequest(BaseModel):
     """Stateful payload structure tracking an ongoing conversational thread with strict security guardrails."""
     session_id: str = Field(..., description="Unique thread identifier tracking a single distinct conversation.")
@@ -223,7 +219,6 @@ class AgentChatRequest(BaseModel):
         """Production Security Guardrail: Scans incoming prompt buffers for malicious system override vectors."""
         cleaned_value = value.strip()
         
-        # 1. Define typical prompt injection and jailbreak attack phrases
         injection_patterns = [
             r"ignore\s+(all\s+)?previous\s+instructions",
             r"system\s+override",
@@ -232,12 +227,10 @@ class AgentChatRequest(BaseModel):
             r"reveal\s+(your\s+)?system\s+prompt"
         ]
         
-        # Check for injection signatures
         for pattern in injection_patterns:
             if re.search(pattern, cleaned_value.lower()):
                 raise ValueError("Security Access Violation: Unauthorized system override signature detected.")
                 
-        # 2. Block system command attempts inside the text buffer
         destructive_keywords = ["rm -rf", "sudo ", "drop table", "delete from chat_history"]
         for keyword in destructive_keywords:
             if keyword in cleaned_value.lower():
@@ -255,7 +248,6 @@ async def agent_reasoning_engine(payload: AgentChatRequest, db: AsyncSession = D
             # 1. Initial Handshake Telemetry
             yield f"data: {json.dumps({'event': 'status', 'message': 'Hydrating conversation memory...'})}\n\n"
             
-            # Fetch chronological history for this session thread
             stmt = (
                 select(models.ChatMessage)
                 .where(models.ChatMessage.session_id == payload.session_id)
@@ -264,7 +256,6 @@ async def agent_reasoning_engine(payload: AgentChatRequest, db: AsyncSession = D
             result = await db.execute(stmt)
             historical_rows = result.scalars().all()
 
-            # Compile structural LangChain historical sequence matrix
             message_list = [
                 SystemMessage(content=(
                     "You are an elite autonomous system agent executing software diagnostic loops.\n"
@@ -277,7 +268,6 @@ async def agent_reasoning_engine(payload: AgentChatRequest, db: AsyncSession = D
                 elif row.role == "model":
                     message_list.append(AIMessage(content=row.content))
 
-            # Append current live prompt execution vector
             message_list.append(HumanMessage(content=payload.user_prompt))
 
             # 2. Analyze Intent & Determine Tool Requirements
@@ -286,7 +276,6 @@ async def agent_reasoning_engine(payload: AgentChatRequest, db: AsyncSession = D
             llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
             llm_with_tools = llm.bind_tools([SearchKnowledgeBase, GetSystemDiagnostics])
             
-            # Primary reasoning loop execution pass
             ai_msg = await llm_with_tools.ainvoke(message_list)
             
             final_answer_text = ""
@@ -300,11 +289,11 @@ async def agent_reasoning_engine(payload: AgentChatRequest, db: AsyncSession = D
                     tool_args = tool_call["args"]
                     executed_tools_list.append(tool_name)
                     
-                    # Notify the frontend UI exactly which system capability is being engaged
                     yield f"data: {json.dumps({'event': 'tool_start', 'tool': tool_name, 'message': f'Executing background system tool: {tool_name}'})}\n\n"
                     
                     if tool_name == "SearchKnowledgeBase":
-                        embeddings_engine = GoogleGenerativeAIEmbedembeddings(
+                        # FIXED: Resolved class name spelling typo here
+                        embeddings_engine = GoogleGenerativeAIEmbeddings(
                             model="models/gemini-embedding-001",
                             output_dimensionality=768
                         )
@@ -332,7 +321,6 @@ async def agent_reasoning_engine(payload: AgentChatRequest, db: AsyncSession = D
 
                     yield f"data: {json.dumps({'event': 'tool_end', 'tool': tool_name})}\n\n"
 
-                # Inject tool tracking observations into synthesis prompt sequence
                 combined_tool_context = "\n\n".join(tool_results)
                 synthesis_prompt = (
                     f"Executed Tool Telemetry Output blocks:\n{combined_tool_context}\n\n"
@@ -344,27 +332,24 @@ async def agent_reasoning_engine(payload: AgentChatRequest, db: AsyncSession = D
             # 4. Asynchronous Token Generation Pass
             yield f"data: {json.dumps({'event': 'status', 'message': 'Generating final response...'})}\n\n"
             
-            # Switch loop to astream chunk generation to extract tokens live
             async for chunk in llm.astream(message_list):
                 if chunk.content:
                     final_answer_text += chunk.content
-                    # Yield raw string token fragments immediately to the client network pipe
                     yield f"data: {json.dumps({'event': 'token', 'text': chunk.content})}\n\n"
 
             # 5. Post-Stream Memory Log Persistence
             user_log = models.ChatMessage(session_id=payload.session_id, role="user", content=payload.user_prompt)
-            agent_log = models.ChatMessage(models.ChatMessage(session_id=payload.session_id, role="model", content=final_answer_text))
+            # FIXED: Removed the invalid nested duplicate class instantiation wrap here
+            agent_log = models.ChatMessage(session_id=payload.session_id, role="model", content=final_answer_text)
             
             db.add(user_log)
             db.add(agent_log)
             await db.commit()
             
-            # Sign off connection cleanly
             yield f"data: {json.dumps({'event': 'done', 'session_id': payload.session_id})}\n\n"
 
         except Exception as e:
             await db.rollback()
             yield f"data: {json.dumps({'event': 'error', 'detail': f'Streaming Pipeline Breakout: {str(e)}'})}\n\n"
 
-    # Return structural content stream interface back to the server gateway
     return StreamingResponse(event_generator(), media_type="text/event-stream")
