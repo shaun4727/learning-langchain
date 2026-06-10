@@ -1,4 +1,26 @@
 
+## 🚀 Live Deployment & Testing
+
+The FastAPI backend for this curriculum is actively deployed and running live on **Render**. You can interact with the streaming Agentic AI engine directly from your local terminal using the configuration below.
+
+* **Production Base URL:** `https://learning-langchain.onrender.com`
+* **Streaming Endpoint:** `/agent-chat`
+
+---
+
+### 🛠️ Verification via cURL
+
+To test the agent's tool-calling, autonomous decision-making, and streaming capabilities, run the following command in your terminal:
+
+```bash
+curl -N -X POST "[https://learning-langchain.onrender.com/agent-chat](https://learning-langchain.onrender.com/agent-chat)" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "session_id": "stream_session_01", 
+       "user_prompt": "Check if my database extensions are online and write a short poem about coding."
+     }'
+
+
 ### Agentic AI Architecture Curriculum
 
 | Phase | Lesson | Core Concepts & Architecture | Official Documentation | Target Actionable Task |
